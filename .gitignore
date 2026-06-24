@@ -1,0 +1,9 @@
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+/workspace/project_name/
+
+# local smoke-test artifacts
+hermes-workspace-smoke.png

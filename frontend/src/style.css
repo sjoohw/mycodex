@@ -1,0 +1,16 @@
+html, body, #root { height: 100%; margin: 0; font-family: Inter, system-ui, sans-serif; }
+.shell { display: grid; grid-template-columns: 320px 1fr 360px; height: 100%; background: #0f172a; color: #e2e8f0; }
+.panel { padding: 20px; background: #111827; border-right: 1px solid #334155; overflow: auto; }
+.monitor { border-left: 1px solid #334155; border-right: 0; }
+.canvas { min-height: 100%; background: radial-gradient(circle at center, #1e293b, #020617); }
+textarea { width: 100%; min-height: 120px; margin: 8px 0 12px; border-radius: 10px; padding: 10px; }
+button { width: 100%; margin: 6px 0; padding: 10px; border-radius: 10px; border: 0; background: #38bdf8; color: #082f49; font-weight: 700; cursor: pointer; }
+.agent-node { min-width: 170px; padding: 16px; border: 2px solid #64748b; border-radius: 16px; background: #0f172a; color: #e2e8f0; box-shadow: 0 10px 30px #0008; display: grid; gap: 6px; }
+.agent-node span, .agent-node small { color: #94a3b8; }
+.agent-node.working { border-color: #22d3ee; animation: pulse 1.2s infinite alternate; }
+.react-flow__edge.animated path { stroke: #38bdf8; stroke-width: 3; filter: drop-shadow(0 0 8px #38bdf8); }
+.logs { display: grid; gap: 10px; }
+.logs article { background: #1e293b; padding: 10px; border-radius: 10px; }
+.logs span { display: block; color: #93c5fd; font-size: 12px; }
+.logs p { margin-bottom: 0; white-space: pre-wrap; }
+@keyframes pulse { from { box-shadow: 0 0 0 #22d3ee; } to { box-shadow: 0 0 24px #22d3ee; } }

@@ -26,12 +26,15 @@ class ProjectStatus(str, Enum):
     paused = "paused"
     review = "review"
     completed = "completed"
+    terminated = "terminated"
 
 
 class AgentProfile(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     name: str
     role: str
+    cautions: str = ""
+    hermes_profile: str | None = None
     is_manager: bool = False
     status: AgentStatus = AgentStatus.idle
 
@@ -78,6 +81,9 @@ class ProjectState(BaseModel):
     events: list[AgentEvent] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     iteration_count: int = 0
+    board_slug: str | None = None
+    kanban: dict = Field(default_factory=dict)
+    todo_path: str | None = None
 
     @property
     def manager(self) -> AgentProfile:

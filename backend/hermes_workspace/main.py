@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+import sys
+import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -13,7 +19,11 @@ from .orchestrator import HermesOrchestrator
 app = FastAPI(title="Hermes Multi-Agent Workspace")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 broker = ConnectionBroker()
-orchestrator = HermesOrchestrator(Path("/workspace/project_name"), broker)
+workspace_root = Path(
+    os.getenv("HERMES_WORKSPACE_ROOT")
+    or (Path.cwd() / "workspace" / "project_name")
+)
+orchestrator = HermesOrchestrator(workspace_root, broker)
 
 
 class MessageRequest(BaseModel):
@@ -30,6 +40,16 @@ class FileRequest(BaseModel):
     command: str | None = None
 
 
+class TodoLoadRequest(BaseModel):
+    config: ProjectConfig
+    path: str
+
+
+class TodoSaveRequest(BaseModel):
+    path: str | None = None
+    content: str
+
+
 class HumanRequest(BaseModel):
     manager_id: str
     worker_id: str | None = None
@@ -37,14 +57,92 @@ class HumanRequest(BaseModel):
     summary: str | None = None
 
 
+class ProfileSummary(BaseModel):
+    id: str
+    name: str
+    hermes_profile: str
+
+
 @app.get("/api/state")
 def get_state():
-    return orchestrator.state
+    return orchestrator.current_state()
+
+
+@app.get("/api/profiles")
+def list_profiles() -> list[ProfileSummary]:
+    profile_root = Path(os.getenv("HERMES_PROFILE_ROOT") or Path(os.getenv("LOCALAPPDATA", "")) / "hermes" / "profiles")
+    if not profile_root.exists():
+        return []
+    profiles = []
+    for path in sorted(profile_root.iterdir()):
+        if path.is_dir() and (path / "config.yaml").exists():
+            profiles.append(
+                ProfileSummary(
+                    id=path.name,
+                    name=path.name.replace("_", " ").replace("-", " ").title(),
+                    hermes_profile=path.name,
+                )
+            )
+    return profiles
 
 
 @app.post("/api/configure")
 async def configure(config: ProjectConfig):
     return await orchestrator.configure(config)
+
+
+@app.post("/api/new-project")
+async def new_project(config: ProjectConfig):
+    return await orchestrator.configure(config)
+
+
+@app.post("/api/generate-todo")
+async def generate_todo(config: ProjectConfig):
+    return await orchestrator.generate_todo(config)
+
+
+@app.get("/api/todo")
+def get_todo(path: str | None = None):
+    state = orchestrator.current_state()
+    todo_path = path or (state.todo_path if state else None)
+    if not todo_path:
+        return {"path": None, "content": ""}
+    file_path = workspace_root / todo_path
+    try:
+        file_path = file_path.resolve()
+        workspace = workspace_root.resolve()
+        if workspace not in file_path.parents and file_path != workspace:
+            raise ValueError("path escapes workspace")
+        return {"path": todo_path, "content": file_path.read_text(encoding="utf-8")}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/save-todo")
+async def save_todo(request: TodoSaveRequest):
+    return await orchestrator.save_todo(request.path or "", request.content)
+
+
+@app.get("/api/todo-files")
+def todo_files() -> list[str]:
+    if not workspace_root.exists():
+        return []
+    ignored_parts = {".hermes", "__pycache__"}
+    files = []
+    for path in workspace_root.rglob("*.md"):
+        relative = path.relative_to(workspace_root)
+        if any(part in ignored_parts for part in relative.parts):
+            continue
+        files.append(relative.as_posix())
+    return sorted(files)
+
+
+@app.post("/api/load-todo")
+async def load_todo(request: TodoLoadRequest):
+    try:
+        return await orchestrator.load_todo(request.config, request.path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/assign-roles")
@@ -60,6 +158,16 @@ async def start_project():
 @app.post("/api/stop")
 async def stop_project():
     return await orchestrator.stop()
+
+
+@app.post("/api/pause")
+async def pause_project():
+    return await orchestrator.pause()
+
+
+@app.post("/api/terminate")
+async def terminate_project():
+    return await orchestrator.terminate()
 
 
 @app.post("/api/send-message")

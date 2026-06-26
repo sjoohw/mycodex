@@ -39,6 +39,7 @@ function emptySlot(index) {
 
 function App() {
   const [goal, setGoal] = useState('Build a resilient web application with clear tests.');
+  const [workPath, setWorkPath] = useState('');
   const [profileCatalog, setProfileCatalog] = useState(defaultCatalog);
   const [slots, setSlots] = useState(defaultSlots);
   const [state, setState] = useState(null);
@@ -65,7 +66,10 @@ function App() {
     fetch('/api/state')
       .then((response) => response.ok ? response.json() : null)
       .then((snapshot) => {
-        if (snapshot) setState(snapshot);
+        if (snapshot) {
+          setState(snapshot);
+          if (snapshot.config?.workspace_root) setWorkPath(snapshot.config.workspace_root);
+        }
       })
       .catch(() => setApiStatus('Backend is not reachable.'));
 
@@ -98,12 +102,14 @@ function App() {
   const projectConfig = useMemo(() => ({
     name: 'hermes-project',
     goal,
+    workspace_root: workPath.trim() || null,
     profiles: configuredProfiles,
-  }), [goal, configuredProfiles]);
+  }), [goal, workPath, configuredProfiles]);
 
   const activeProfiles = state?.config?.profiles || configuredProfiles;
   const events = state?.events || [];
   const tasks = state?.kanban?.tasks || [];
+  const projectRunning = state?.status === 'running';
   const todoSteps = useMemo(() => parseTodoSteps(todoContent), [todoContent]);
   const currentTask = tasks.find((task) => task.status === 'running') || tasks.find((task) => ['ready', 'todo', 'review'].includes(task.status));
 
@@ -173,7 +179,7 @@ function App() {
     try {
       const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
       const text = await response.text();
-      if (!response.ok) throw new Error(text || `${response.status} ${response.statusText}`);
+      if (!response.ok) throw new Error(errorMessage(text, `${response.status} ${response.statusText}`));
       const nextState = text ? JSON.parse(text) : null;
       if (nextState) setState(nextState);
       setApiStatus(`${path} completed`);
@@ -194,6 +200,10 @@ function App() {
 
   function requestGenerateTodo() {
     if (!requireProfiles()) return;
+    if (projectRunning) {
+      setApiStatus('Pause or stop before changing project settings.');
+      return;
+    }
     setConfirmTodo(true);
   }
 
@@ -205,6 +215,10 @@ function App() {
 
   async function newProject() {
     if (!requireProfiles()) return;
+    if (projectRunning) {
+      setApiStatus('Pause or stop before changing project settings.');
+      return;
+    }
     setTodoContent('');
     setTodoDraft('');
     setTodoPath('');
@@ -213,8 +227,19 @@ function App() {
 
   async function openLoadTodo() {
     if (!requireProfiles()) return;
-    const response = await fetch('/api/todo-files');
-    setMdFiles(response.ok ? await response.json() : []);
+    if (projectRunning) {
+      setApiStatus('Pause or stop before changing project settings.');
+      return;
+    }
+    const query = workPath.trim() ? `?workspace_root=${encodeURIComponent(workPath.trim())}` : '';
+    const response = await fetch(`/api/todo-files${query}`);
+    const text = await response.text();
+    if (!response.ok) {
+      setApiStatus(errorMessage(text, 'Could not load markdown files.'));
+      setMdFiles([]);
+      return;
+    }
+    setMdFiles(text ? JSON.parse(text) : []);
     setLoadOpen(true);
   }
 
@@ -239,17 +264,19 @@ function App() {
     <aside className="panel control">
       <h1>Hermes Workspace</h1>
       <label>Project Goal<textarea value={goal} onChange={(event) => setGoal(event.target.value)} /></label>
+      <label>Work Path<input type="text" value={workPath} disabled={projectRunning} placeholder="Default: ./workspace/project_name" onChange={(event) => setWorkPath(event.target.value)} /></label>
       <div className="toolbar">
-        <button title="New project" disabled={isPosting} onClick={newProject}>↻</button>
+        <button title="New project" disabled={isPosting || projectRunning} onClick={newProject}>↻</button>
         <button title="Play" disabled={isPosting} onClick={() => post('/api/start')}>▶</button>
         <button title="Pause" disabled={isPosting} onClick={() => post('/api/pause')}>⏸</button>
         <button title="Stop" disabled={isPosting} onClick={() => post('/api/terminate')}>■</button>
       </div>
-      <button disabled={isPosting} onClick={requestGenerateTodo}>Generate To-do list</button>
-      <button disabled={isPosting} onClick={openLoadTodo}>Load To-do list</button>
+      <button disabled={isPosting || projectRunning} onClick={requestGenerateTodo}>Generate To-do list</button>
+      <button disabled={isPosting || projectRunning} onClick={openLoadTodo}>Load To-do list</button>
       {todoPath && <button className="doc-button" onClick={() => { setTodoDraft(todoContent); setTodoEditorOpen(true); }}>📄 {todoPath}</button>}
       <p className={`api-status ${apiStatus.toLowerCase().includes('failed') || apiStatus.toLowerCase().includes('error') ? 'error' : ''}`}>{apiStatus}</p>
       <p>Status: <b>{state?.status || 'not configured'}</b></p>
+      <p>Path: <b>{state?.config?.workspace_root || workPath || 'default'}</b></p>
       <p>Board: <b>{state?.board_slug || '-'}</b></p>
     </aside>
 
@@ -340,6 +367,16 @@ function App() {
       </article>) : <p>No log for this agent.</p>}</div>
     </Modal>}
   </main>;
+}
+
+function errorMessage(text, fallback) {
+  if (!text) return fallback;
+  try {
+    const payload = JSON.parse(text);
+    return payload.detail || fallback;
+  } catch {
+    return text;
+  }
 }
 
 function Modal({ title, children, onClose }) {

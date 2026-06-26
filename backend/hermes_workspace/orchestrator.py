@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import subprocess
 from contextlib import suppress
@@ -14,21 +15,25 @@ from .storage import StateStore
 
 class HermesOrchestrator:
     def __init__(self, workspace_root: Path, broker: ConnectionBroker, kanban_client: KanbanClient | None = None):
-        self.workspace_root = workspace_root
-        self.shared_root = workspace_root / "shared"
+        self.default_workspace_root = workspace_root.resolve()
+        self.workspace_root = self.default_workspace_root
+        self.shared_root = self.workspace_root / "shared"
         self.shared_root.mkdir(parents=True, exist_ok=True)
-        self.store = StateStore(workspace_root / ".hermes")
+        self.store = StateStore(self.workspace_root / ".hermes")
         self.broker = broker
         self.kanban = kanban_client or KanbanClient()
         self.state = self.store.load()
         self._project_task: asyncio.Task | None = None
 
     async def configure(self, config: ProjectConfig) -> ProjectState:
+        next_root = self.resolve_workspace_root(config.workspace_root)
         if self._project_task and not self._project_task.done():
-            self._project_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._project_task
+            raise RuntimeError("project is running. Pause or stop before changing project settings.")
+        if self.state and self.state.status == ProjectStatus.running:
+            raise RuntimeError("project is running. Pause or stop before changing project settings.")
         self._project_task = None
+        self._apply_workspace_root(next_root)
+        config.workspace_root = str(self.workspace_root)
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.shared_root.mkdir(parents=True, exist_ok=True)
         for profile in config.profiles:
@@ -38,6 +43,50 @@ class HermesOrchestrator:
         self.state.kanban = {"tasks": [], "swarm": {}, "known_statuses": {}}
         await self._record("system", "system", None, f"New project created: {config.name}")
         return self.state
+
+    def resolve_workspace_root(self, workspace_root: str | None) -> Path:
+        if workspace_root and workspace_root.strip():
+            raw_path = workspace_root.strip().strip('"')
+            if not raw_path:
+                return self.default_workspace_root
+            self._validate_workspace_root_text(raw_path)
+            next_root = Path(raw_path).expanduser().resolve()
+        else:
+            next_root = self.default_workspace_root
+        if next_root == Path(next_root.anchor):
+            raise ValueError("workspace_root cannot be a filesystem root")
+        if next_root.exists() and not next_root.is_dir():
+            raise ValueError("workspace_root must be a directory path")
+        return next_root
+
+    def _validate_workspace_root_text(self, raw_path: str) -> None:
+        if "\x00" in raw_path or any(ord(char) < 32 for char in raw_path):
+            raise ValueError("workspace_root contains invalid control characters")
+        if os.name != "nt":
+            return
+        reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+        invalid_chars = set('<>"|?*')
+        path = Path(raw_path)
+        for part in path.parts:
+            if part in {path.anchor, path.drive, "\\", "/"}:
+                continue
+            if any(char in invalid_chars for char in part) or ":" in part:
+                raise ValueError("workspace_root contains characters not allowed on Windows")
+            stem = part.split(".")[0].upper()
+            if stem in reserved:
+                raise ValueError("workspace_root contains a reserved Windows name")
+
+    def _apply_workspace_root(self, next_root: Path) -> None:
+        if next_root == self.workspace_root:
+            return
+        self.workspace_root = next_root
+        self.shared_root = self.workspace_root / "shared"
+        try:
+            self.shared_root.mkdir(parents=True, exist_ok=True)
+            (self.workspace_root / ".hermes").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"cannot create workspace directory: {exc}") from exc
+        self.store = StateStore(self.workspace_root / ".hermes")
 
     async def generate_todo(self, config: ProjectConfig) -> ProjectState:
         state = await self.configure(config)

@@ -36,6 +36,9 @@ html, body, #root {
   border-left: 1px solid rgba(255, 255, 255, 0.05);
   border-right: 0;
 }
+.control p {
+  overflow-wrap: anywhere;
+}
 
 .workspace {
   min-height: 100%;

@@ -43,6 +43,7 @@ class ProjectConfig(BaseModel):
     name: str = "hermes-project"
     goal: str
     profiles: list[AgentProfile]
+    workspace_root: str | None = None
 
     @field_validator("profiles")
     @classmethod

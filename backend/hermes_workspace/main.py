@@ -63,6 +63,10 @@ class ProfileSummary(BaseModel):
     hermes_profile: str
 
 
+def request_error(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc))
+
+
 @app.get("/api/state")
 def get_state():
     return orchestrator.current_state()
@@ -88,17 +92,26 @@ def list_profiles() -> list[ProfileSummary]:
 
 @app.post("/api/configure")
 async def configure(config: ProjectConfig):
-    return await orchestrator.configure(config)
+    try:
+        return await orchestrator.configure(config)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise request_error(exc)
 
 
 @app.post("/api/new-project")
 async def new_project(config: ProjectConfig):
-    return await orchestrator.configure(config)
+    try:
+        return await orchestrator.configure(config)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise request_error(exc)
 
 
 @app.post("/api/generate-todo")
 async def generate_todo(config: ProjectConfig):
-    return await orchestrator.generate_todo(config)
+    try:
+        return await orchestrator.generate_todo(config)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise request_error(exc)
 
 
 @app.get("/api/todo")
@@ -107,10 +120,10 @@ def get_todo(path: str | None = None):
     todo_path = path or (state.todo_path if state else None)
     if not todo_path:
         return {"path": None, "content": ""}
-    file_path = workspace_root / todo_path
+    file_path = orchestrator.workspace_root / todo_path
     try:
         file_path = file_path.resolve()
-        workspace = workspace_root.resolve()
+        workspace = orchestrator.workspace_root.resolve()
         if workspace not in file_path.parents and file_path != workspace:
             raise ValueError("path escapes workspace")
         return {"path": todo_path, "content": file_path.read_text(encoding="utf-8")}
@@ -120,17 +133,26 @@ def get_todo(path: str | None = None):
 
 @app.post("/api/save-todo")
 async def save_todo(request: TodoSaveRequest):
-    return await orchestrator.save_todo(request.path or "", request.content)
+    try:
+        return await orchestrator.save_todo(request.path or "", request.content)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise request_error(exc)
 
 
 @app.get("/api/todo-files")
-def todo_files() -> list[str]:
-    if not workspace_root.exists():
+def todo_files(workspace_root: str | None = None) -> list[str]:
+    try:
+        root = orchestrator.resolve_workspace_root(workspace_root) if workspace_root is not None else orchestrator.workspace_root
+    except (ValueError, OSError) as exc:
+        raise request_error(exc)
+    if root.exists() and not root.is_dir():
+        raise HTTPException(status_code=400, detail="workspace_root must be a directory path")
+    if not root.exists():
         return []
     ignored_parts = {".hermes", "__pycache__"}
     files = []
-    for path in workspace_root.rglob("*.md"):
-        relative = path.relative_to(workspace_root)
+    for path in root.rglob("*.md"):
+        relative = path.relative_to(root)
         if any(part in ignored_parts for part in relative.parts):
             continue
         files.append(relative.as_posix())
@@ -141,8 +163,8 @@ def todo_files() -> list[str]:
 async def load_todo(request: TodoLoadRequest):
     try:
         return await orchestrator.load_todo(request.config, request.path)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise request_error(exc)
 
 
 @app.post("/api/assign-roles")

@@ -171,24 +171,41 @@ class KanbanClient:
         found = shutil.which("hermes")
         if found:
             return found
-        local_app_data = os.getenv("LOCALAPPDATA")
-        if local_app_data:
-            candidate = Path(local_app_data) / "hermes" / "hermes-agent" / "venv" / "Scripts" / "hermes.exe"
+        for candidate in self._hermes_executable_candidates():
             if candidate.exists():
                 return str(candidate)
         return "hermes"
 
     def _path_with_hermes(self, current_path: str) -> str:
-        local_app_data = os.getenv("LOCALAPPDATA")
-        if not local_app_data:
-            return current_path
-        parts = [
-            str(Path(local_app_data) / "hermes" / "hermes-agent" / "venv" / "Scripts"),
-            str(Path(local_app_data) / "hermes" / "git" / "cmd"),
-            str(Path(local_app_data) / "hermes" / "git" / "bin"),
-            current_path,
-        ]
+        parts = [str(path) for path in self._extra_path_dirs() if path.exists()]
+        parts.append(current_path)
         return os.pathsep.join(part for part in parts if part)
+
+    def _hermes_executable_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            local_root = Path(local_app_data) / "hermes"
+            candidates.append(local_root / "hermes-agent" / "venv" / "Scripts" / "hermes.exe")
+        home = Path.home()
+        candidates.extend([
+            home / ".local" / "bin" / "hermes",
+            home / ".local" / "share" / "hermes" / "hermes-agent" / "venv" / "bin" / "hermes",
+            home / ".config" / "hermes" / "hermes-agent" / "venv" / "bin" / "hermes",
+            home / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes",
+        ])
+        return candidates
+
+    def _extra_path_dirs(self) -> list[Path]:
+        dirs = [path.parent for path in self._hermes_executable_candidates()]
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            local_root = Path(local_app_data) / "hermes"
+            dirs.extend([
+                local_root / "git" / "cmd",
+                local_root / "git" / "bin",
+            ])
+        return dirs
 
 
 def board_slug_for(project_id: str, project_name: str) -> str:

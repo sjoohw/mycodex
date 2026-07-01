@@ -133,6 +133,11 @@ button:disabled {
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
 }
+.dashboard-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
 .toolbar button {
   min-height: 44px;
   font-size: 18px;

@@ -2,36 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
-const defaultCatalog = [
-  { id: 'layout_architect', name: 'Layout Architect', hermes_profile: 'layout_architect' },
-  { id: 'layout_designer', name: 'Layout Designer', hermes_profile: 'layout_designer' },
-  { id: 'layout_qa', name: 'Layout QA', hermes_profile: 'layout_qa' },
-];
-
-const defaultSlots = [
-  {
-    id: 'slot_1',
-    profile: defaultCatalog[0],
-    role: 'Plans structure, routes work, and synthesizes final review',
-    cautions: 'Ask for human input only on real blockers.',
-    is_manager: true,
-  },
-  {
-    id: 'slot_2',
-    profile: defaultCatalog[1],
-    role: 'Implements the requested deliverables',
-    cautions: 'Do not block just because QA is pending.',
-    is_manager: false,
-  },
-  {
-    id: 'slot_3',
-    profile: defaultCatalog[2],
-    role: 'Verifies outputs, regressions, and final readiness',
-    cautions: 'Use concrete file and command evidence.',
-    is_manager: false,
-  },
-  { id: 'slot_4', profile: null, role: '', cautions: '', is_manager: false },
-];
+const defaultSlots = Array.from({ length: 4 }, (_, index) => emptySlot(index));
 
 function emptySlot(index) {
   return { id: `slot_${index + 1}`, profile: null, role: '', cautions: '', is_manager: false };
@@ -40,10 +11,11 @@ function emptySlot(index) {
 function App() {
   const [goal, setGoal] = useState('Build a resilient web application with clear tests.');
   const [workPath, setWorkPath] = useState('');
-  const [profileCatalog, setProfileCatalog] = useState(defaultCatalog);
+  const [profileCatalog, setProfileCatalog] = useState([]);
   const [slots, setSlots] = useState(defaultSlots);
   const [state, setState] = useState(null);
   const [apiStatus, setApiStatus] = useState('Ready');
+  const [profileError, setProfileError] = useState('');
   const [isPosting, setIsPosting] = useState(false);
   const [pickerSlot, setPickerSlot] = useState(null);
   const [confirmTodo, setConfirmTodo] = useState(false);
@@ -54,14 +26,24 @@ function App() {
   const [loadOpen, setLoadOpen] = useState(false);
   const [mdFiles, setMdFiles] = useState([]);
   const [logAgent, setLogAgent] = useState(null);
+  const [dashboardLoadOpen, setDashboardLoadOpen] = useState(false);
+  const [dashboardPresets, setDashboardPresets] = useState([]);
 
   useEffect(() => {
     fetch('/api/profiles')
-      .then((response) => response.ok ? response.json() : [])
-      .then((profiles) => {
-        if (profiles.length) setProfileCatalog(profiles);
+      .then(async (response) => {
+        const text = await response.text();
+        if (!response.ok) throw new Error(errorMessage(text, 'Hermes profiles could not be loaded.'));
+        return text ? JSON.parse(text) : [];
       })
-      .catch(() => {});
+      .then((profiles) => {
+        setProfileCatalog(profiles);
+        setProfileError(profiles.length ? '' : 'Error: no Hermes profiles found.');
+      })
+      .catch((error) => {
+        setProfileCatalog([]);
+        setProfileError(error instanceof Error ? error.message : 'Hermes profiles could not be loaded.');
+      });
 
     fetch('/api/state')
       .then((response) => response.ok ? response.json() : null)
@@ -192,6 +174,96 @@ function App() {
     }
   }
 
+  function dashboardPayload(name) {
+    return {
+      name,
+      goal,
+      workspace_root: workPath.trim() || null,
+      slots: slots.map((slot) => ({
+        id: slot.id,
+        profile: slot.profile,
+        role: slot.role || '',
+        cautions: slot.cautions || '',
+        is_manager: Boolean(slot.is_manager),
+      })),
+    };
+  }
+
+  function normalizeDashboardSlots(savedSlots) {
+    const restored = Array.from({ length: 4 }, (_, index) => emptySlot(index));
+    savedSlots.slice(0, 4).forEach((slot, index) => {
+      restored[index] = {
+        ...emptySlot(index),
+        ...slot,
+        id: `slot_${index + 1}`,
+        profile: slot.profile || null,
+        role: slot.role || '',
+        cautions: slot.cautions || '',
+        is_manager: Boolean(slot.is_manager),
+      };
+    });
+    return restored;
+  }
+
+  async function saveDashboardPreset() {
+    const name = window.prompt('Dashboard preset name', 'default');
+    if (!name) return;
+    setIsPosting(true);
+    try {
+      const response = await fetch('/api/dashboard-presets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dashboardPayload(name)),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(errorMessage(text, 'Could not save dashboard preset.'));
+      const preset = text ? JSON.parse(text) : null;
+      setApiStatus(`Saved dashboard preset: ${preset?.name || name}`);
+    } catch (error) {
+      setApiStatus(error instanceof Error ? error.message : 'Could not save dashboard preset.');
+    } finally {
+      setIsPosting(false);
+    }
+  }
+
+  async function openDashboardLoad() {
+    if (projectRunning) {
+      setApiStatus('Pause or stop before changing project settings.');
+      return;
+    }
+    setIsPosting(true);
+    try {
+      const response = await fetch('/api/dashboard-presets');
+      const text = await response.text();
+      if (!response.ok) throw new Error(errorMessage(text, 'Could not load dashboard presets.'));
+      setDashboardPresets(text ? JSON.parse(text) : []);
+      setDashboardLoadOpen(true);
+    } catch (error) {
+      setApiStatus(error instanceof Error ? error.message : 'Could not load dashboard presets.');
+    } finally {
+      setIsPosting(false);
+    }
+  }
+
+  async function loadDashboardPreset(name) {
+    setIsPosting(true);
+    try {
+      const response = await fetch(`/api/dashboard-presets/${encodeURIComponent(name)}`);
+      const text = await response.text();
+      if (!response.ok) throw new Error(errorMessage(text, 'Could not load dashboard preset.'));
+      const preset = JSON.parse(text);
+      setGoal(preset.goal || '');
+      setWorkPath(preset.workspace_root || '');
+      setSlots(normalizeDashboardSlots(preset.slots || []));
+      setDashboardLoadOpen(false);
+      setApiStatus(`Loaded dashboard preset: ${preset.name}`);
+    } catch (error) {
+      setApiStatus(error instanceof Error ? error.message : 'Could not load dashboard preset.');
+    } finally {
+      setIsPosting(false);
+    }
+  }
+
   function requireProfiles() {
     if (configuredProfiles.length > 0) return true;
     setApiStatus('Error: assign at least one profile first.');
@@ -265,6 +337,10 @@ function App() {
       <h1>Hermes Workspace</h1>
       <label>Project Goal<textarea value={goal} onChange={(event) => setGoal(event.target.value)} /></label>
       <label>Work Path<input type="text" value={workPath} disabled={projectRunning} placeholder="Default: ./workspace/project_name" onChange={(event) => setWorkPath(event.target.value)} /></label>
+      <div className="dashboard-actions">
+        <button disabled={isPosting} onClick={saveDashboardPreset}>Save Dashboard</button>
+        <button disabled={isPosting || projectRunning} onClick={openDashboardLoad}>Load Dashboard</button>
+      </div>
       <div className="toolbar">
         <button title="New project" disabled={isPosting || projectRunning} onClick={newProject}>↻</button>
         <button title="Play" disabled={isPosting} onClick={() => post('/api/start')}>▶</button>
@@ -275,6 +351,7 @@ function App() {
       <button disabled={isPosting || projectRunning} onClick={openLoadTodo}>Load To-do list</button>
       {todoPath && <button className="doc-button" onClick={() => { setTodoDraft(todoContent); setTodoEditorOpen(true); }}>📄 {todoPath}</button>}
       <p className={`api-status ${apiStatus.toLowerCase().includes('failed') || apiStatus.toLowerCase().includes('error') ? 'error' : ''}`}>{apiStatus}</p>
+      {profileError && <p className="api-status error">{profileError}</p>}
       <p>Status: <b>{state?.status || 'not configured'}</b></p>
       <p>Path: <b>{state?.config?.workspace_root || workPath || 'default'}</b></p>
       <p>Board: <b>{state?.board_slug || '-'}</b></p>
@@ -297,7 +374,9 @@ function App() {
             </header>
 
             {pickerSlot === slot.id && <div className="picker">
-              {profileCatalog.map((profile) => <button key={profile.id} type="button" onClick={() => assignProfile(slot.id, profile)}>{profile.name}</button>)}
+              {profileCatalog.length
+                ? profileCatalog.map((profile) => <button key={profile.id} type="button" onClick={() => assignProfile(slot.id, profile)}>{profile.name}</button>)
+                : <p>No Hermes profiles loaded.</p>}
             </div>}
 
             {slot.profile && <>
@@ -357,6 +436,12 @@ function App() {
 
     {loadOpen && <Modal title="Load To-do list" onClose={() => setLoadOpen(false)}>
       <div className="modal-list">{mdFiles.length ? mdFiles.map((file) => <button key={file} onClick={() => loadTodo(file)}>{file}</button>) : <p>No markdown files found.</p>}</div>
+    </Modal>}
+
+    {dashboardLoadOpen && <Modal title="Load Dashboard" onClose={() => setDashboardLoadOpen(false)}>
+      <div className="modal-list">{dashboardPresets.length ? dashboardPresets.map((preset) => <button key={preset.name} onClick={() => loadDashboardPreset(preset.name)}>
+        {preset.name}{preset.updated_at ? ` · ${new Date(preset.updated_at).toLocaleString()}` : ''}
+      </button>) : <p>No dashboard presets saved.</p>}</div>
     </Modal>}
 
     {logAgent && <Modal title={`${logAgent.name} Log`} onClose={() => setLogAgent(null)}>

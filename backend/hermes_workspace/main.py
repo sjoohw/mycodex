@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import sys
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -10,7 +13,7 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .broker import ConnectionBroker
 from .models import ProjectConfig
@@ -63,8 +66,76 @@ class ProfileSummary(BaseModel):
     hermes_profile: str
 
 
+class DashboardSlot(BaseModel):
+    id: str
+    profile: ProfileSummary | None = None
+    role: str = ""
+    cautions: str = ""
+    is_manager: bool = False
+
+
+class DashboardPreset(BaseModel):
+    name: str
+    goal: str = ""
+    workspace_root: str | None = None
+    slots: list[DashboardSlot] = Field(default_factory=list)
+
+
+class DashboardPresetSummary(BaseModel):
+    name: str
+    updated_at: str | None = None
+
+
 def request_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
+
+
+def dashboard_store_root() -> Path:
+    configured = os.getenv("HERMES_DASHBOARD_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.cwd() / "workspace" / "dashboard_presets"
+
+
+def dashboard_preset_path(name: str) -> Path:
+    clean = name.strip()
+    if not clean:
+        raise ValueError("dashboard preset name is required")
+    if len(clean) > 80:
+        raise ValueError("dashboard preset name must be 80 characters or shorter")
+    if clean in {".", ".."} or Path(clean).name != clean:
+        raise ValueError("dashboard preset name must not contain path separators")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*", clean):
+        raise ValueError("dashboard preset name contains invalid characters")
+    return dashboard_store_root() / f"{clean}.json"
+
+
+def profile_search_roots() -> list[Path]:
+    configured = os.getenv("HERMES_PROFILE_ROOT")
+    if configured:
+        return [Path(configured).expanduser()]
+
+    roots: list[Path] = []
+    if sys.platform == "win32":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            roots.append(Path(local_app_data) / "hermes" / "profiles")
+    else:
+        xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+        if xdg_config_home:
+            roots.append(Path(xdg_config_home) / "hermes" / "profiles")
+        home = Path.home()
+        roots.extend([
+            home / ".config" / "hermes" / "profiles",
+            home / ".hermes" / "profiles",
+            home / ".local" / "share" / "hermes" / "profiles",
+        ])
+    return roots
+
+
+def profile_error(message: str, roots: list[Path]) -> HTTPException:
+    searched = ", ".join(str(root) for root in roots) or "no profile roots configured"
+    return HTTPException(status_code=404, detail=f"{message}. Searched: {searched}")
 
 
 @app.get("/api/state")
@@ -74,20 +145,72 @@ def get_state():
 
 @app.get("/api/profiles")
 def list_profiles() -> list[ProfileSummary]:
-    profile_root = Path(os.getenv("HERMES_PROFILE_ROOT") or Path(os.getenv("LOCALAPPDATA", "")) / "hermes" / "profiles")
-    if not profile_root.exists():
-        return []
+    roots = profile_search_roots()
     profiles = []
-    for path in sorted(profile_root.iterdir()):
-        if path.is_dir() and (path / "config.yaml").exists():
-            profiles.append(
-                ProfileSummary(
-                    id=path.name,
-                    name=path.name.replace("_", " ").replace("-", " ").title(),
-                    hermes_profile=path.name,
+    existing_roots = [root for root in roots if root.exists() and root.is_dir()]
+    if not existing_roots:
+        raise profile_error("Hermes profile directory was not found", roots)
+    for profile_root in existing_roots:
+        for path in sorted(profile_root.iterdir()):
+            if path.is_dir() and (path / "config.yaml").exists():
+                profiles.append(
+                    ProfileSummary(
+                        id=path.name,
+                        name=path.name.replace("_", " ").replace("-", " ").title(),
+                        hermes_profile=path.name,
+                    )
                 )
-            )
+    if not profiles:
+        raise profile_error("No Hermes profiles with config.yaml were found", existing_roots)
     return profiles
+
+
+@app.get("/api/dashboard-presets")
+def list_dashboard_presets() -> list[DashboardPresetSummary]:
+    root = dashboard_store_root()
+    if not root.exists():
+        return []
+    presets = []
+    for path in sorted(root.glob("*.json")):
+        updated_at = None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            updated_at = data.get("updated_at")
+        except (OSError, json.JSONDecodeError):
+            pass
+        presets.append(DashboardPresetSummary(name=path.stem, updated_at=updated_at))
+    return presets
+
+
+@app.post("/api/dashboard-presets")
+def save_dashboard_preset(preset: DashboardPreset) -> DashboardPresetSummary:
+    try:
+        if len(preset.slots) > 4:
+            raise ValueError("dashboard preset can contain at most 4 slots")
+        path = dashboard_preset_path(preset.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        updated_at = datetime.now(timezone.utc).isoformat()
+        payload = preset.model_dump(mode="json")
+        payload["name"] = preset.name.strip()
+        payload["updated_at"] = updated_at
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+        return DashboardPresetSummary(name=payload["name"], updated_at=updated_at)
+    except (ValueError, OSError) as exc:
+        raise request_error(exc)
+
+
+@app.get("/api/dashboard-presets/{name}")
+def load_dashboard_preset(name: str) -> DashboardPreset:
+    try:
+        path = dashboard_preset_path(name)
+        if not path.exists():
+            raise ValueError("dashboard preset was not found")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return DashboardPreset(**data)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        raise request_error(exc)
 
 
 @app.post("/api/configure")

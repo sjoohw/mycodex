@@ -1,6 +1,10 @@
 import pytest
+from fastapi import HTTPException
 
+from backend.hermes_workspace import main as app_main
 from backend.hermes_workspace.broker import ConnectionBroker
+from backend.hermes_workspace.kanban_client import KanbanClient
+from backend.hermes_workspace import kanban_client as kanban_module
 from backend.hermes_workspace.models import AgentProfile, ProjectConfig, ProjectStatus
 from backend.hermes_workspace.orchestrator import HermesOrchestrator
 
@@ -157,6 +161,85 @@ def test_workspace_root_rejects_control_characters(tmp_path):
 
     with pytest.raises(ValueError, match="control characters"):
         orchestrator.resolve_workspace_root(f"{tmp_path}\ninvalid")
+
+
+def test_profiles_are_loaded_from_configured_root(tmp_path, monkeypatch):
+    profile_root = tmp_path / "profiles"
+    profile_dir = profile_root / "linux_profile"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_PROFILE_ROOT", str(profile_root))
+
+    profiles = app_main.list_profiles()
+
+    assert [profile.hermes_profile for profile in profiles] == ["linux_profile"]
+
+
+def test_linux_profile_search_roots_include_xdg_config(tmp_path, monkeypatch):
+    xdg_root = tmp_path / "xdg"
+    monkeypatch.delenv("HERMES_PROFILE_ROOT", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_root))
+    monkeypatch.setattr(app_main.sys, "platform", "linux")
+
+    roots = app_main.profile_search_roots()
+
+    assert roots[0] == xdg_root / "hermes" / "profiles"
+    assert any(root.as_posix().endswith(".config/hermes/profiles") for root in roots)
+
+
+def test_profiles_error_when_root_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_ROOT", str(tmp_path / "missing"))
+
+    with pytest.raises(HTTPException, match="profile directory"):
+        app_main.list_profiles()
+
+
+def test_dashboard_preset_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_ROOT", str(tmp_path / "dashboards"))
+    preset = app_main.DashboardPreset(
+        name="teg-demo",
+        goal="Build TEG layout",
+        workspace_root=str(tmp_path / "workspace"),
+        slots=[
+            app_main.DashboardSlot(
+                id="slot_1",
+                profile=app_main.ProfileSummary(id="layout", name="Layout", hermes_profile="layout"),
+                role="Implement layout",
+                cautions="Verify pitch",
+                is_manager=True,
+            )
+        ],
+    )
+
+    saved = app_main.save_dashboard_preset(preset)
+    loaded = app_main.load_dashboard_preset("teg-demo")
+    summaries = app_main.list_dashboard_presets()
+
+    assert saved.name == "teg-demo"
+    assert loaded.goal == "Build TEG layout"
+    assert loaded.slots[0].profile.hermes_profile == "layout"
+    assert summaries[0].name == "teg-demo"
+
+
+def test_dashboard_preset_rejects_path_like_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_DASHBOARD_ROOT", str(tmp_path / "dashboards"))
+
+    with pytest.raises(HTTPException, match="path separators"):
+        app_main.save_dashboard_preset(app_main.DashboardPreset(name="../bad"))
+
+
+def test_kanban_client_resolves_linux_home_candidate(tmp_path, monkeypatch):
+    executable = tmp_path / ".local" / "bin" / "hermes"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+    monkeypatch.delenv("HERMES_EXECUTABLE", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(kanban_module.shutil, "which", lambda _: None)
+    monkeypatch.setattr(kanban_module.Path, "home", classmethod(lambda cls: tmp_path))
+
+    client = KanbanClient()
+
+    assert client.executable == str(executable)
 
 
 @pytest.mark.anyio

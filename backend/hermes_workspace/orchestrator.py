@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
 from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .broker import ConnectionBroker
@@ -24,6 +26,10 @@ class HermesOrchestrator:
         self.kanban = kanban_client or KanbanClient()
         self.state = self.store.load()
         self._project_task: asyncio.Task | None = None
+        self.monitor_interval_seconds = self._env_int("HERMES_MONITOR_INTERVAL_SECONDS", 15, minimum=1)
+        self.kanban_call_timeout_seconds = self._env_int("HERMES_KANBAN_CALL_TIMEOUT_SECONDS", 180, minimum=5)
+        self.running_stall_seconds = self._env_int("HERMES_RUNNING_STALL_SECONDS", 300, minimum=30)
+        self.running_stall_iterations = self._env_int("HERMES_RUNNING_STALL_ITERATIONS", 8, minimum=1)
 
     async def configure(self, config: ProjectConfig) -> ProjectState:
         next_root = self.resolve_workspace_root(config.workspace_root)
@@ -167,8 +173,7 @@ class HermesOrchestrator:
 
     async def pause(self) -> ProjectState:
         state = self._require_state()
-        if self._project_task and not self._project_task.done():
-            self._project_task.cancel()
+        await self._cancel_project_task()
         state.status = ProjectStatus.paused
         for profile in state.config.profiles:
             profile.status = AgentStatus.paused
@@ -180,8 +185,7 @@ class HermesOrchestrator:
 
     async def terminate(self) -> ProjectState:
         state = self._require_state()
-        if self._project_task and not self._project_task.done():
-            self._project_task.cancel()
+        await self._cancel_project_task()
         state.status = ProjectStatus.terminated
         for profile in state.config.profiles:
             profile.status = AgentStatus.idle
@@ -231,27 +235,25 @@ class HermesOrchestrator:
         try:
             while True:
                 state.iteration_count += 1
-                dispatch_result = await self.kanban.dispatch(board=state.board_slug or "default")
+                self._set_monitor_heartbeat(state, "dispatching")
+                dispatch_result = await self._kanban_call(
+                    "dispatch",
+                    self.kanban.dispatch(board=state.board_slug or "default"),
+                )
                 state.kanban["last_dispatch"] = dispatch_result
                 self._sync_workspace_files(state)
+                self._set_monitor_heartbeat(state, "syncing")
                 tasks = await self._sync_kanban_state(state)
                 blocked_tasks = [task for task in tasks if task.get("status") == "blocked"]
                 if blocked_tasks:
-                    state.status = ProjectStatus.paused
-                    log_snippets = await self._blocked_task_logs(state, blocked_tasks)
-                    for profile in state.config.profiles:
-                        profile_tasks = [
-                            task for task in blocked_tasks
-                            if task.get("assignee") == self._hermes_profile(profile)
-                        ]
-                        if profile_tasks:
-                            profile.status = AgentStatus.error
-                    await self._record(
-                        "human_request",
-                        state.manager.id,
-                        None,
-                        self._blocked_summary(blocked_tasks, log_snippets),
-                        {"board_slug": state.board_slug, "blocked_tasks": blocked_tasks, "logs": log_snippets},
+                    await self._pause_for_blocked_tasks(state, blocked_tasks)
+                    return
+                stalled_tasks = self._stalled_running_tasks(state, tasks)
+                if stalled_tasks:
+                    await self._pause_for_blocked_tasks(
+                        state,
+                        stalled_tasks,
+                        reason="Running Kanban task did not report progress before the stall timeout.",
                     )
                     return
                 terminal = self._kanban_terminal(tasks)
@@ -276,16 +278,35 @@ class HermesOrchestrator:
                             {"board_slug": state.board_slug, "files": state.files},
                         )
                     return
-                await asyncio.sleep(15)
+                self._set_monitor_heartbeat(state, "sleeping")
+                await asyncio.sleep(self.monitor_interval_seconds)
         except asyncio.CancelledError:
             await self._record("status", "system", None, "Project run cancelled.")
             raise
         except Exception as exc:
-            state.status = ProjectStatus.paused
-            for profile in state.config.profiles:
-                if profile.status == AgentStatus.working:
-                    profile.status = AgentStatus.error
-            await self._record("system", "system", None, f"Project run failed: {exc}")
+            await self._pause_for_runtime_error(state, exc)
+
+    async def _cancel_project_task(self) -> None:
+        task = self._project_task
+        if not task or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(task, timeout=5)
+
+    async def _kanban_call(self, label: str, awaitable):
+        try:
+            return await asyncio.wait_for(awaitable, timeout=self.kanban_call_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Kanban {label} timed out after {self.kanban_call_timeout_seconds}s") from exc
+
+    def _set_monitor_heartbeat(self, state: ProjectState, phase: str) -> None:
+        state.kanban["monitor"] = {
+            "phase": phase,
+            "iteration": state.iteration_count,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.store.save(state)
 
     async def _ensure_kanban_board(self, state: ProjectState) -> None:
         if not state.board_slug:
@@ -325,7 +346,7 @@ class HermesOrchestrator:
         return swarm
 
     async def _sync_kanban_state(self, state: ProjectState) -> list[dict]:
-        tasks = await self.kanban.list_tasks(board=state.board_slug or "default")
+        tasks = await self._kanban_call("list_tasks", self.kanban.list_tasks(board=state.board_slug or "default"))
         state.kanban["tasks"] = tasks
         known_statuses = state.kanban.setdefault("known_statuses", {})
         for profile in state.config.profiles:
@@ -348,6 +369,58 @@ class HermesOrchestrator:
                     {"task": task, "board_slug": state.board_slug},
                 )
         return tasks
+
+    def _stalled_running_tasks(self, state: ProjectState, tasks: list[dict]) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        monitor = state.kanban.setdefault("task_monitor", {})
+        active_ids = set()
+        stalled = []
+        for task in tasks:
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                continue
+            active_ids.add(task_id)
+            fingerprint = self._task_fingerprint(task)
+            entry = monitor.get(task_id)
+            if not entry or entry.get("fingerprint") != fingerprint:
+                entry = {
+                    "fingerprint": fingerprint,
+                    "last_change_at": now.isoformat(),
+                    "last_change_iteration": state.iteration_count,
+                    "running_since": now.isoformat() if task.get("status") == "running" else None,
+                }
+                monitor[task_id] = entry
+                continue
+            if task.get("status") != "running":
+                entry["running_since"] = None
+                continue
+            entry["running_since"] = entry.get("running_since") or now.isoformat()
+            last_change_at = self._parse_iso_datetime(entry.get("last_change_at")) or now
+            stale_seconds = (now - last_change_at).total_seconds()
+            stale_iterations = state.iteration_count - int(entry.get("last_change_iteration") or state.iteration_count)
+            if stale_seconds >= self.running_stall_seconds and stale_iterations >= self.running_stall_iterations:
+                stalled.append(task)
+        for task_id in list(monitor):
+            if task_id not in active_ids:
+                monitor.pop(task_id, None)
+        return stalled
+
+    def _task_fingerprint(self, task: dict) -> str:
+        tracked = {
+            "status": task.get("status"),
+            "title": task.get("title"),
+            "assignee": task.get("assignee"),
+            "updated_at": task.get("updated_at") or task.get("updated") or task.get("mtime"),
+            "progress": task.get("progress"),
+        }
+        return json.dumps(tracked, sort_keys=True, default=str)
+
+    def _parse_iso_datetime(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        with suppress(ValueError):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return None
 
     def _sync_workspace_files(self, state: ProjectState) -> None:
         if not self.workspace_root.exists():
@@ -388,13 +461,52 @@ class HermesOrchestrator:
             if not task_id:
                 continue
             try:
-                logs[task_id] = await self.kanban.task_log(board=state.board_slug or "default", task_id=task_id, tail=2000)
+                logs[task_id] = await self._kanban_call(
+                    "task_log",
+                    self.kanban.task_log(board=state.board_slug or "default", task_id=task_id, tail=2000),
+                )
             except Exception as exc:
                 logs[task_id] = f"Could not read task log: {exc}"
         return logs
 
-    def _blocked_summary(self, blocked_tasks: list[dict], logs: dict[str, str]) -> str:
-        lines = ["One or more Kanban tasks are blocked."]
+    async def _pause_for_blocked_tasks(self, state: ProjectState, blocked_tasks: list[dict], reason: str = "One or more Kanban tasks are blocked.") -> None:
+        state.status = ProjectStatus.paused
+        log_snippets = await self._blocked_task_logs(state, blocked_tasks)
+        for profile in state.config.profiles:
+            profile_tasks = [
+                task for task in blocked_tasks
+                if task.get("assignee") == self._hermes_profile(profile)
+            ]
+            if profile_tasks:
+                profile.status = AgentStatus.error
+        await self._record(
+            "human_request",
+            state.manager.id,
+            None,
+            self._blocked_summary(blocked_tasks, log_snippets, reason),
+            {"board_slug": state.board_slug, "blocked_tasks": blocked_tasks, "logs": log_snippets},
+        )
+
+    async def _pause_for_runtime_error(self, state: ProjectState, exc: Exception) -> None:
+        state.status = ProjectStatus.paused
+        state.kanban["monitor_error"] = {
+            "message": str(exc),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "iteration": state.iteration_count,
+        }
+        for profile in state.config.profiles:
+            if profile.status == AgentStatus.working:
+                profile.status = AgentStatus.error
+        await self._record(
+            "human_request",
+            state.manager.id,
+            None,
+            f"Project monitor failed and paused the run: {exc}",
+            {"board_slug": state.board_slug, "error": str(exc)},
+        )
+
+    def _blocked_summary(self, blocked_tasks: list[dict], logs: dict[str, str], reason: str = "One or more Kanban tasks are blocked.") -> str:
+        lines = [reason]
         for task in blocked_tasks:
             task_id = str(task.get("id") or "")
             title = str(task.get("title") or "Untitled task")
@@ -474,6 +586,14 @@ Profiles:
 
     def _hermes_profile(self, profile) -> str:
         return profile.hermes_profile or profile.id
+
+    def _env_int(self, name: str, default: int, minimum: int) -> int:
+        raw_value = os.getenv(name)
+        if not raw_value:
+            return default
+        with suppress(ValueError):
+            return max(int(raw_value), minimum)
+        return default
 
     async def _record(self, event_type: str, source: str, target: str | None, content: str, metadata: dict | None = None) -> AgentEvent:
         state = self._require_state() if self.state else None

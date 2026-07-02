@@ -4,8 +4,9 @@ import asyncio
 import json
 import os
 import re
+import signal
 import shutil
-import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -127,37 +128,81 @@ class KanbanClient:
         if board:
             env["HERMES_KANBAN_BOARD"] = board
         args = [self.executable, "kanban", *kanban_args]
-        return await asyncio.to_thread(
-            self._run_blocking,
-            args,
-            env,
-            timeout or self.timeout_seconds,
-        )
+        return await self._run_process(args, env, timeout or self.timeout_seconds)
 
-    def _run_blocking(self, args: list[str], env: dict[str, str], timeout: int) -> KanbanCommandResult:
+    async def _run_process(self, args: list[str], env: dict[str, str], timeout: int) -> KanbanCommandResult:
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000200  # CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+
         try:
-            completed = subprocess.run(
-                args,
-                text=True,
-                capture_output=True,
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 env=env,
-                timeout=timeout,
+                **kwargs,
             )
-        except subprocess.TimeoutExpired as exc:
+        except FileNotFoundError as exc:
+            return KanbanCommandResult(args=args, stdout="", stderr=str(exc), returncode=127)
+        except PermissionError as exc:
+            return KanbanCommandResult(args=args, stdout="", stderr=str(exc), returncode=126)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await self._terminate_process_tree(process)
+            stdout, stderr = await process.communicate()
             return KanbanCommandResult(
                 args=args,
-                stdout=self._decode_timeout_output(exc.stdout),
-                stderr=(self._decode_timeout_output(exc.stderr) + "\nTimed out.").strip(),
+                stdout=self._decode_process_output(stdout),
+                stderr=(self._decode_process_output(stderr) + f"\nTimed out after {timeout}s.").strip(),
                 returncode=124,
             )
+        except asyncio.CancelledError:
+            await self._terminate_process_tree(process)
+            raise
         return KanbanCommandResult(
             args=args,
-            stdout=(completed.stdout or "").strip(),
-            stderr=(completed.stderr or "").strip(),
-            returncode=completed.returncode,
+            stdout=self._decode_process_output(stdout),
+            stderr=self._decode_process_output(stderr),
+            returncode=process.returncode or 0,
         )
 
-    def _decode_timeout_output(self, output: str | bytes | None) -> str:
+    async def _terminate_process_tree(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        if os.name == "nt":
+            with suppress(FileNotFoundError, PermissionError):
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(process.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.communicate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+
+    def _decode_process_output(self, output: str | bytes | None) -> str:
         if output is None:
             return ""
         if isinstance(output, bytes):

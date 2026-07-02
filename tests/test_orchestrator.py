@@ -1,3 +1,7 @@
+import asyncio
+import os
+import sys
+
 import pytest
 from fastapi import HTTPException
 
@@ -58,6 +62,33 @@ class FakeKanbanClient:
 
     async def task_log(self, *, board, task_id, tail=6000):
         return f"log for {task_id}"
+
+
+class HangingDispatchKanbanClient(FakeKanbanClient):
+    async def dispatch(self, *, board, max_spawns=4):
+        await asyncio.sleep(3600)
+
+
+class StalledRunningKanbanClient(FakeKanbanClient):
+    async def create_swarm(self, *, board, goal, worker_specs, verifier, synthesizer, created_by, idempotency_key):
+        swarm = await super().create_swarm(
+            board=board,
+            goal=goal,
+            worker_specs=worker_specs,
+            verifier=verifier,
+            synthesizer=synthesizer,
+            created_by=created_by,
+            idempotency_key=idempotency_key,
+        )
+        self.tasks = [
+            {"id": "root", "title": "Swarm root", "status": "done", "assignee": created_by},
+            {"id": "worker-task", "title": "Designer work", "status": "running", "assignee": "layout_designer"},
+        ]
+        return swarm
+
+    async def dispatch(self, *, board, max_spawns=4):
+        self.dispatch_count += 1
+        return {"spawned": []}
 
 
 @pytest.mark.anyio
@@ -240,6 +271,101 @@ def test_kanban_client_resolves_linux_home_candidate(tmp_path, monkeypatch):
     client = KanbanClient()
 
     assert client.executable == str(executable)
+
+
+@pytest.mark.anyio
+async def test_kanban_client_process_timeout_returns_124():
+    client = KanbanClient(executable=sys.executable, timeout_seconds=1)
+
+    result = await client._run_process(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        os.environ.copy(),
+        timeout=1,
+    )
+
+    assert result.returncode == 124
+    assert "Timed out after 1s." in result.stderr
+
+
+@pytest.mark.anyio
+async def test_kanban_client_missing_executable_returns_127():
+    client = KanbanClient(executable="definitely-not-a-real-hermes-command", timeout_seconds=1)
+
+    result = await client._run_process(
+        ["definitely-not-a-real-hermes-command", "kanban", "list"],
+        os.environ.copy(),
+        timeout=1,
+    )
+
+    assert result.returncode == 127
+
+
+@pytest.mark.anyio
+async def test_dispatch_timeout_pauses_project(tmp_path):
+    orchestrator = HermesOrchestrator(tmp_path, ConnectionBroker(), kanban_client=HangingDispatchKanbanClient())
+    orchestrator.kanban_call_timeout_seconds = 0.01
+    await orchestrator.configure(
+        ProjectConfig(
+            goal="Build",
+            profiles=[
+                AgentProfile(id="layout_architect", name="Architect", role="Plan", hermes_profile="layout_architect", is_manager=True),
+                AgentProfile(id="layout_designer", name="Designer", role="Build", hermes_profile="layout_designer"),
+            ],
+        )
+    )
+
+    state = await orchestrator.start()
+    await asyncio.wait_for(orchestrator._project_task, timeout=1)
+
+    assert state.status == ProjectStatus.paused
+    assert any("Kanban dispatch timed out" in event.content and event.type == "human_request" for event in state.events)
+    assert state.kanban["monitor"]["phase"] == "dispatching"
+
+
+@pytest.mark.anyio
+async def test_running_task_stall_pauses_project(tmp_path):
+    fake_kanban = StalledRunningKanbanClient()
+    orchestrator = HermesOrchestrator(tmp_path, ConnectionBroker(), kanban_client=fake_kanban)
+    orchestrator.monitor_interval_seconds = 0.01
+    orchestrator.running_stall_seconds = 0
+    orchestrator.running_stall_iterations = 1
+    await orchestrator.configure(
+        ProjectConfig(
+            goal="Build",
+            profiles=[
+                AgentProfile(id="layout_architect", name="Architect", role="Plan", hermes_profile="layout_architect", is_manager=True),
+                AgentProfile(id="layout_designer", name="Designer", role="Build", hermes_profile="layout_designer"),
+            ],
+        )
+    )
+
+    state = await orchestrator.start()
+    await asyncio.wait_for(orchestrator._project_task, timeout=1)
+
+    assert state.status == ProjectStatus.paused
+    assert any("did not report progress" in event.content for event in state.events)
+    assert state.config.profiles[1].status.value == "error"
+
+
+@pytest.mark.anyio
+async def test_pause_cancels_background_monitor(tmp_path):
+    orchestrator = HermesOrchestrator(tmp_path, ConnectionBroker(), kanban_client=HangingDispatchKanbanClient())
+    await orchestrator.configure(
+        ProjectConfig(
+            goal="Build",
+            profiles=[
+                AgentProfile(id="layout_architect", name="Architect", role="Plan", hermes_profile="layout_architect", is_manager=True),
+                AgentProfile(id="layout_designer", name="Designer", role="Build", hermes_profile="layout_designer"),
+            ],
+        )
+    )
+
+    state = await orchestrator.start()
+    await asyncio.sleep(0)
+    await orchestrator.pause()
+
+    assert state.status == ProjectStatus.paused
+    assert orchestrator._project_task.done()
 
 
 @pytest.mark.anyio
